@@ -8,6 +8,13 @@ export type ChatAbortControllerEntry = {
   expiresAtMs: number;
   ownerConnId?: string;
   ownerDeviceId?: string;
+  /**
+   * Which RPC owns this registration. Absent (undefined) is treated as
+   * `"chat-send"` so pre-existing callers that constructed entries without
+   * a kind keep their behavior. Consumers that need "chat.send specifically
+   * is active" must check `kind !== "agent"`, not just `.has(runId)`.
+   */
+  kind?: "chat-send" | "agent";
 };
 
 export function isChatStopCommandText(text: string): boolean {

@@ -897,6 +897,7 @@ export const agentHandlers: GatewayRequestHandlers = {
         ownerConnId: typeof client?.connId === "string" ? client.connId : undefined,
         ownerDeviceId:
           typeof client?.connect?.device?.id === "string" ? client.connect.device.id : undefined,
+        kind: "agent",
       });
     }
 
@@ -1088,7 +1089,11 @@ export const agentHandlers: GatewayRequestHandlers = {
       typeof p.timeoutMs === "number" && Number.isFinite(p.timeoutMs)
         ? Math.max(0, Math.floor(p.timeoutMs))
         : 30_000;
-    const hasActiveChatRun = context.chatAbortControllers.has(runId);
+    // `hasActiveChatRun` drives snapshot preference, so it must reflect
+    // chat.send specifically — not an agent-kind entry registered by the
+    // `agent` RPC for its own abort surface.
+    const activeChatEntry = context.chatAbortControllers.get(runId);
+    const hasActiveChatRun = activeChatEntry !== undefined && activeChatEntry.kind !== "agent";
 
     const cachedGatewaySnapshot = readTerminalSnapshotFromGatewayDedupe({
       dedupe: context.dedupe,
