@@ -58,6 +58,15 @@ export type MainSessionRecoveryResult = {
 };
 
 /**
+ * Captured once at module load so every scheduler invocation in this
+ * process shares the same "anything newer than this was touched by the
+ * current gateway" cutoff. Using module-load time (rather than Date.now()
+ * inside the scheduler) guarantees the cutoff is never after a session
+ * the current process has already written to.
+ */
+const PROCESS_BOOT_MS = Date.now();
+
+/**
  * Exclude session keys that already have their own recovery (subagent) or
  * lifecycle ownership (cron, ACP). Also treat any entry with a non-null
  * `subagentRole` or positive `spawnDepth` as out-of-scope, so callers of
@@ -139,10 +148,12 @@ function extractMessageText(msg: unknown): string | undefined {
 /**
  * A session is resumable when the newest meaningful turn is a tool_result
  * (with no trailing assistant message). Walking backwards past compaction
- * markers, the first turn we decide on is either:
+ * markers only, the first turn we decide on is either:
  *   - an assistant turn              → tool-use loop already completed
  *   - a tool_result carrier          → orphaned mid-loop, resume it
  *   - a plain user turn              → pending new request, not our bug shape
+ *   - any other role (system, tool
+ *     metadata, unknown)             → unrecognised tail, do not resume
  */
 export function isMainSessionResumable(messages: unknown[]): boolean {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
@@ -157,9 +168,7 @@ export function isMainSessionResumable(messages: unknown[]): boolean {
     if ((role === "user" || role === "tool") && hasToolResultContent(msg)) {
       return true;
     }
-    if (role === "user" || role === "tool") {
-      return false;
-    }
+    return false;
   }
   return false;
 }
@@ -246,10 +255,11 @@ async function processAgentSessionStore(params: {
   storePath: string;
   nowMs: number;
   staleMs: number;
+  bootMs: number;
   resumedSessionKeys: Set<string>;
   result: MainSessionRecoveryResult;
 }): Promise<void> {
-  const { storePath, nowMs, staleMs, resumedSessionKeys, result } = params;
+  const { storePath, nowMs, staleMs, bootMs, resumedSessionKeys, result } = params;
   let store: Record<string, SessionEntry>;
   try {
     store = loadSessionStore(storePath);
@@ -264,6 +274,13 @@ async function processAgentSessionStore(params: {
       continue;
     }
     if (shouldSkipForMainRecovery(entry, sessionKey)) {
+      continue;
+    }
+    // Gate on the boot timestamp: anything touched at/after this process
+    // started is a session the current gateway is actively driving (e.g. a
+    // user message that landed during the scheduler's 5 s bootstrap delay),
+    // not an orphan from a previous lifetime.
+    if (typeof entry.updatedAt === "number" && entry.updatedAt >= bootMs) {
       continue;
     }
     if (resumedSessionKeys.has(sessionKey)) {
@@ -315,6 +332,7 @@ export async function recoverOrphanedMainSessions(
     stateDir?: string;
     nowMs?: number;
     staleMs?: number;
+    bootMs?: number;
     resumedSessionKeys?: Set<string>;
   } = {},
 ): Promise<MainSessionRecoveryResult> {
@@ -327,6 +345,7 @@ export async function recoverOrphanedMainSessions(
   const resumedSessionKeys = params.resumedSessionKeys ?? new Set<string>();
   const nowMs = params.nowMs ?? Date.now();
   const staleMs = params.staleMs ?? SESSION_RUNNING_STALE_MS;
+  const bootMs = params.bootMs ?? PROCESS_BOOT_MS;
 
   try {
     const stateDir = params.stateDir ?? resolveStateDir(process.env);
@@ -346,6 +365,7 @@ export async function recoverOrphanedMainSessions(
         storePath,
         nowMs,
         staleMs,
+        bootMs,
         resumedSessionKeys,
         result,
       });
@@ -371,10 +391,12 @@ export function scheduleMainSessionOrphanRecovery(
     maxRetries?: number;
     staleMs?: number;
     stateDir?: string;
+    bootMs?: number;
   } = {},
 ): void {
   const initialDelay = params.delayMs ?? DEFAULT_RECOVERY_DELAY_MS;
   const maxRetries = params.maxRetries ?? MAX_RECOVERY_RETRIES;
+  const bootMs = params.bootMs ?? PROCESS_BOOT_MS;
   const resumedSessionKeys = new Set<string>();
 
   const attemptRecovery = (attempt: number, delay: number) => {
@@ -382,15 +404,23 @@ export function scheduleMainSessionOrphanRecovery(
       void recoverOrphanedMainSessions({
         stateDir: params.stateDir,
         staleMs: params.staleMs,
+        bootMs,
         resumedSessionKeys,
       })
         .then((result) => {
-          if (result.failed > 0 && attempt < maxRetries) {
+          if (result.failed === 0) {
+            return;
+          }
+          if (attempt < maxRetries) {
             const nextDelay = delay * RETRY_BACKOFF_MULTIPLIER;
             log.info(
               `main-session orphan recovery had ${result.failed} failure(s); retrying in ${nextDelay}ms (attempt ${attempt + 1}/${maxRetries})`,
             );
             attemptRecovery(attempt + 1, nextDelay);
+          } else {
+            log.warn(
+              `main-session orphan recovery gave up after ${maxRetries} retries; ${result.failed} session(s) remain status:"running"`,
+            );
           }
         })
         .catch((err) => {

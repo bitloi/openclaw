@@ -74,6 +74,16 @@ function compactionMarker(): TestMessage {
   };
 }
 
+/**
+ * The production `PROCESS_BOOT_MS` is frozen at module load, which for the
+ * test file is strictly before any test runs. Fixture sessions built with
+ * `updatedAt: Date.now()` are therefore always "after boot" by default and
+ * would be skipped by the boot-time gate. Tests that expect the scanner to
+ * act on a fixture pass `bootMs: TEST_BOOT_MS` (1 hour in the future) so the
+ * fixture's `updatedAt` looks strictly pre-boot.
+ */
+const TEST_BOOT_MS = Date.now() + 60 * 60 * 1000;
+
 function mockSingleRunningSession(
   entryOverrides: Partial<sessions.SessionEntry> = {},
   messages: unknown[] = [],
@@ -148,6 +158,19 @@ describe("isMainSessionResumable", () => {
       ]),
     ).toBe(true);
   });
+
+  it("returns false when the tail is a non-compaction system message", () => {
+    // A plain system message after the tool_result (not a compaction marker)
+    // is an unrecognised shape; we do not resume speculatively.
+    expect(
+      isMainSessionResumable([
+        userText("do the thing"),
+        assistantText("running tool..."),
+        toolResultTurn(),
+        { role: "system", content: [{ type: "text", text: "session reset hint" }] },
+      ]),
+    ).toBe(false);
+  });
 });
 
 describe("recoverOrphanedMainSessions", () => {
@@ -178,6 +201,7 @@ describe("recoverOrphanedMainSessions", () => {
 
     const result = await recoverOrphanedMainSessions({
       nowMs: Date.now(),
+      bootMs: TEST_BOOT_MS,
       resumedSessionKeys: new Set<string>(),
     });
 
@@ -206,7 +230,7 @@ describe("recoverOrphanedMainSessions", () => {
       assistantText("here is the answer"),
     ]);
 
-    const result = await recoverOrphanedMainSessions({ nowMs: Date.now() });
+    const result = await recoverOrphanedMainSessions({ nowMs: Date.now(), bootMs: TEST_BOOT_MS });
 
     expect(result.recovered).toBe(0);
     expect(result.skipped).toBe(1);
@@ -224,11 +248,33 @@ describe("recoverOrphanedMainSessions", () => {
       } as sessions.SessionEntry,
     });
 
-    const result = await recoverOrphanedMainSessions({ nowMs: Date.now() });
+    const result = await recoverOrphanedMainSessions({ nowMs: Date.now(), bootMs: TEST_BOOT_MS });
 
     expect(result.recovered).toBe(0);
     expect(result.skipped).toBe(0);
     expect(gateway.callGateway).not.toHaveBeenCalled();
+  });
+
+  it("skips sessions whose updatedAt is newer than bootMs (owned by current process)", async () => {
+    // Fixture is `updatedAt: now`; pass a bootMs strictly before `now` so the
+    // scanner treats the session as touched by the current process.
+    const now = Date.now();
+    mockSingleRunningSession({ updatedAt: now }, [
+      userText("fresh user message"),
+      assistantText("running tool"),
+      toolResultTurn(),
+    ]);
+
+    const result = await recoverOrphanedMainSessions({
+      nowMs: now + 100,
+      bootMs: now - 1000,
+    });
+
+    expect(result.recovered).toBe(0);
+    expect(result.skipped).toBe(0);
+    expect(result.expired).toBe(0);
+    expect(gateway.callGateway).not.toHaveBeenCalled();
+    expect(sessions.updateSessionStore).not.toHaveBeenCalled();
   });
 
   it("skips subagent entries by spawnDepth (handled by subagent orphan recovery)", async () => {
@@ -246,7 +292,7 @@ describe("recoverOrphanedMainSessions", () => {
       toolResultTurn(),
     ]);
 
-    const result = await recoverOrphanedMainSessions({ nowMs: Date.now() });
+    const result = await recoverOrphanedMainSessions({ nowMs: Date.now(), bootMs: TEST_BOOT_MS });
 
     expect(result.recovered).toBe(0);
     expect(result.skipped).toBe(0);
@@ -268,7 +314,7 @@ describe("recoverOrphanedMainSessions", () => {
       toolResultTurn(),
     ]);
 
-    const result = await recoverOrphanedMainSessions({ nowMs: Date.now() });
+    const result = await recoverOrphanedMainSessions({ nowMs: Date.now(), bootMs: TEST_BOOT_MS });
 
     expect(result.recovered).toBe(0);
     expect(gateway.callGateway).not.toHaveBeenCalled();
@@ -288,7 +334,7 @@ describe("recoverOrphanedMainSessions", () => {
       toolResultTurn(),
     ]);
 
-    const result = await recoverOrphanedMainSessions({ nowMs: Date.now() });
+    const result = await recoverOrphanedMainSessions({ nowMs: Date.now(), bootMs: TEST_BOOT_MS });
 
     expect(result.recovered).toBe(0);
     expect(gateway.callGateway).not.toHaveBeenCalled();
@@ -308,7 +354,7 @@ describe("recoverOrphanedMainSessions", () => {
       toolResultTurn(),
     ]);
 
-    const result = await recoverOrphanedMainSessions({ nowMs: Date.now() });
+    const result = await recoverOrphanedMainSessions({ nowMs: Date.now(), bootMs: TEST_BOOT_MS });
 
     expect(result.recovered).toBe(0);
     expect(gateway.callGateway).not.toHaveBeenCalled();
@@ -323,6 +369,7 @@ describe("recoverOrphanedMainSessions", () => {
 
     const result = await recoverOrphanedMainSessions({
       nowMs: now,
+      bootMs: TEST_BOOT_MS,
       staleMs: 60 * 60 * 1000,
     });
 
@@ -357,6 +404,7 @@ describe("recoverOrphanedMainSessions", () => {
 
     const result = await recoverOrphanedMainSessions({
       nowMs: now,
+      bootMs: TEST_BOOT_MS,
       staleMs: 60 * 60 * 1000,
     });
 
@@ -374,7 +422,7 @@ describe("recoverOrphanedMainSessions", () => {
     ]);
     vi.mocked(gateway.callGateway).mockRejectedValue(new Error("gateway unavailable"));
 
-    const result = await recoverOrphanedMainSessions({ nowMs: Date.now() });
+    const result = await recoverOrphanedMainSessions({ nowMs: Date.now(), bootMs: TEST_BOOT_MS });
 
     expect(result.recovered).toBe(0);
     expect(result.failed).toBe(1);
@@ -389,7 +437,7 @@ describe("recoverOrphanedMainSessions", () => {
       toolResultTurn(),
     ]);
 
-    await recoverOrphanedMainSessions({ nowMs: Date.now() });
+    await recoverOrphanedMainSessions({ nowMs: Date.now(), bootMs: TEST_BOOT_MS });
 
     const call = getResumeCall();
     const message = (call.params as Record<string, unknown>).message as string;
@@ -407,10 +455,12 @@ describe("recoverOrphanedMainSessions", () => {
     const resumedSessionKeys = new Set<string>();
     const first = await recoverOrphanedMainSessions({
       nowMs: Date.now(),
+      bootMs: TEST_BOOT_MS,
       resumedSessionKeys,
     });
     const second = await recoverOrphanedMainSessions({
       nowMs: Date.now(),
+      bootMs: TEST_BOOT_MS,
       resumedSessionKeys,
     });
 
@@ -448,7 +498,7 @@ describe("recoverOrphanedMainSessions", () => {
       toolResultTurn(),
     ]);
 
-    const result = await recoverOrphanedMainSessions({ nowMs: Date.now() });
+    const result = await recoverOrphanedMainSessions({ nowMs: Date.now(), bootMs: TEST_BOOT_MS });
 
     expect(result.recovered).toBe(2);
     expect(gateway.callGateway).toHaveBeenCalledTimes(2);
