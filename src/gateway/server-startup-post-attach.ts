@@ -354,6 +354,12 @@ export async function startGatewaySidecars(params: {
     scheduleSubagentOrphanRecovery();
   });
 
+  await measureStartup(params.startupTrace, "sidecars.main-session-recovery", async () => {
+    const { scheduleMainSessionOrphanRecovery } =
+      await import("../agents/main-session-orphan-recovery.js");
+    scheduleMainSessionOrphanRecovery();
+  });
+
   return { pluginServices };
 }
 
