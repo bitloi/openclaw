@@ -5,6 +5,7 @@ import {
   normalizeSpawnedRunMetadata,
   resolveIngressWorkspaceOverrideForSpawnedRun,
 } from "../../agents/spawned-context.js";
+import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
 import {
   resolveBareResetBootstrapFileAccess,
   resolveBareSessionResetPromptState,
@@ -58,6 +59,7 @@ import {
   normalizeMessageChannel,
 } from "../../utils/message-channel.js";
 import { resolveAssistantIdentity } from "../assistant-identity.js";
+import { resolveChatRunExpiresAtMs } from "../chat-abort.js";
 import { MediaOffloadError, parseMessageWithAttachments } from "../chat-attachments.js";
 import { resolveAssistantAvatarUrl } from "../control-ui-shared.js";
 import { ADMIN_SCOPE } from "../method-scopes.js";
@@ -301,6 +303,9 @@ function dispatchAgentRunFromGateway(params: {
         runId: params.runId,
         error: formatForLog(err),
       });
+    })
+    .finally(() => {
+      params.context.chatAbortControllers.delete(params.runId);
     });
 }
 
@@ -862,6 +867,30 @@ export const agentHandlers: GatewayRequestHandlers = {
 
     const deliver = request.deliver === true && resolvedChannel !== INTERNAL_MESSAGE_CHANNEL;
 
+    // Register into chatAbortControllers so chat.abort / sessions.abort can
+    // interrupt this run. Must happen before the accepted ack so a client
+    // aborting as soon as it sees the ack does not race the map entry.
+    // Skip when no sessionKey (chat.abort requires one) or when a chat.send
+    // with the same runId already owns the entry.
+    const agentRunAbortController = new AbortController();
+    if (resolvedSessionKey && !context.chatAbortControllers.has(runId)) {
+      const now = Date.now();
+      const timeoutMs = resolveAgentTimeoutMs({
+        cfg: cfgForAgent ?? cfg,
+        overrideSeconds: typeof request.timeout === "number" ? request.timeout : undefined,
+      });
+      context.chatAbortControllers.set(runId, {
+        controller: agentRunAbortController,
+        sessionId: resolvedSessionId ?? runId,
+        sessionKey: resolvedSessionKey,
+        startedAtMs: now,
+        expiresAtMs: resolveChatRunExpiresAtMs({ now, timeoutMs }),
+        ownerConnId: typeof client?.connId === "string" ? client.connId : undefined,
+        ownerDeviceId:
+          typeof client?.connect?.device?.id === "string" ? client.connect.device.id : undefined,
+      });
+    }
+
     const accepted = {
       runId,
       status: "accepted" as const,
@@ -962,6 +991,7 @@ export const agentHandlers: GatewayRequestHandlers = {
         bootstrapContextRunKind: request.bootstrapContextRunKind,
         internalEvents: request.internalEvents,
         inputProvenance,
+        abortSignal: agentRunAbortController.signal,
         // Internal-only: allow workspace override for spawned subagent runs.
         workspaceDir: resolveIngressWorkspaceOverrideForSpawnedRun({
           spawnedBy: spawnedByValue,
