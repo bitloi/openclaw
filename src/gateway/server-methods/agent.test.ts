@@ -1558,6 +1558,8 @@ describe("gateway agent handler", () => {
 describe("gateway agent handler chat.abort integration", () => {
   afterEach(() => {
     mocks.agentCommand.mockReset();
+    mocks.getLatestSubagentRunByChildSessionKey.mockReset();
+    mocks.replaceSubagentRunAfterSteer.mockReset();
   });
 
   function prime(sessionId = "existing-session-id", cfg: Record<string, unknown> = {}) {
@@ -1592,6 +1594,29 @@ describe("gateway agent handler chat.abort integration", () => {
     expect(entry?.sessionId).toBe("existing-session-id");
     expect(entry?.ownerConnId).toBe("conn-1");
     expect(entry?.controller.signal.aborted).toBe(false);
+    expect((entry?.expiresAtMs ?? 0) - (entry?.startedAtMs ?? 0)).toBeGreaterThan(24 * 60 * 60_000);
+  });
+
+  it("uses the explicit no-timeout agent expiry instead of the chat 24h cap", async () => {
+    prime();
+    mocks.agentCommand.mockReturnValueOnce(new Promise(() => {}));
+
+    const context = makeContext();
+    const runId = "idem-abort-no-timeout";
+    await invokeAgent(
+      {
+        message: "hi",
+        agentId: "main",
+        sessionKey: "agent:main:main",
+        idempotencyKey: runId,
+        timeout: 0,
+      },
+      { context, reqId: runId },
+    );
+
+    const entry = context.chatAbortControllers.get(runId);
+    expect(entry).toBeDefined();
+    expect((entry?.expiresAtMs ?? 0) - (entry?.startedAtMs ?? 0)).toBeGreaterThan(24 * 60 * 60_000);
   });
 
   it("sets the maintenance expiry to the configured agent timeout, not the 24h chat default", async () => {
@@ -1748,6 +1773,42 @@ describe("gateway agent handler chat.abort integration", () => {
     await waitForAssertion(() => {
       expect(context.chatAbortControllers.has(runId)).toBe(false);
     });
+  });
+
+  it("removes the chatAbortControllers entry if pre-dispatch reactivation fails", async () => {
+    prime("reactivation-session");
+    mocks.getLatestSubagentRunByChildSessionKey.mockReturnValueOnce({
+      runId: "previous-run",
+      childSessionKey: "agent:main:main",
+      controllerSessionKey: "agent:main:main",
+      ownerKey: "agent:main:main",
+      scopeKind: "session",
+      requesterDisplayKey: "main",
+      task: "old task",
+      cleanup: "keep",
+      createdAt: 1,
+      startedAt: 2,
+      endedAt: 3,
+      outcome: { status: "ok" },
+    });
+    mocks.replaceSubagentRunAfterSteer.mockRejectedValueOnce(new Error("reactivate boom"));
+
+    const context = makeContext();
+    const runId = "idem-abort-reactivation-fails";
+    await expect(
+      invokeAgent(
+        {
+          message: "hi",
+          agentId: "main",
+          sessionKey: "agent:main:main",
+          idempotencyKey: runId,
+        },
+        { context, reqId: runId },
+      ),
+    ).rejects.toThrow("reactivate boom");
+
+    expect(context.chatAbortControllers.has(runId)).toBe(false);
+    expect(mocks.agentCommand).not.toHaveBeenCalled();
   });
 
   it("does not overwrite or evict a pre-existing chatAbortControllers entry with the same runId", async () => {

@@ -59,7 +59,7 @@ import {
   normalizeMessageChannel,
 } from "../../utils/message-channel.js";
 import { resolveAssistantIdentity } from "../assistant-identity.js";
-import { resolveChatRunExpiresAtMs } from "../chat-abort.js";
+import { registerChatAbortController, resolveAgentRunExpiresAtMs } from "../chat-abort.js";
 import { MediaOffloadError, parseMessageWithAttachments } from "../chat-attachments.js";
 import { resolveAssistantAvatarUrl } from "../control-ui-shared.js";
 import { ADMIN_SCOPE } from "../method-scopes.js";
@@ -876,34 +876,27 @@ export const agentHandlers: GatewayRequestHandlers = {
 
     const deliver = request.deliver === true && resolvedChannel !== INTERNAL_MESSAGE_CHANNEL;
 
-    // Register into chatAbortControllers so chat.abort / sessions.abort can
-    // interrupt this run. Must happen before the accepted ack so a client
-    // aborting as soon as it sees the ack does not race the map entry.
-    // Skip when no sessionKey (chat.abort requires one) or when a chat.send
-    // with the same runId already owns the entry.
-    const agentRunAbortController = new AbortController();
-    if (resolvedSessionKey && !context.chatAbortControllers.has(runId)) {
-      const now = Date.now();
-      const timeoutMs = resolveAgentTimeoutMs({
-        cfg: cfgForAgent ?? cfg,
-        overrideSeconds: typeof request.timeout === "number" ? request.timeout : undefined,
-      });
-      context.chatAbortControllers.set(runId, {
-        controller: agentRunAbortController,
-        sessionId: resolvedSessionId ?? runId,
-        sessionKey: resolvedSessionKey,
-        startedAtMs: now,
-        // Agent runs routinely exceed chat.send's 24h default cap (48h
-        // default timeout, indefinite when `timeout=0`). Pin the maintenance
-        // expiry to the configured timeout + grace so long-running autonomous
-        // agents are not force-aborted by the dedupe sweep.
-        expiresAtMs: resolveChatRunExpiresAtMs({ now, timeoutMs, maxMs: timeoutMs + 60_000 }),
-        ownerConnId: typeof client?.connId === "string" ? client.connId : undefined,
-        ownerDeviceId:
-          typeof client?.connect?.device?.id === "string" ? client.connect.device.id : undefined,
-        kind: "agent",
-      });
-    }
+    // Register before the accepted ack so an immediate chat.abort/sessions.abort
+    // cannot race the active-run entry. Agent RPC runs use the agent timeout;
+    // chat.send keeps the shorter chat cleanup cap.
+    const now = Date.now();
+    const timeoutMs = resolveAgentTimeoutMs({
+      cfg: cfgForAgent ?? cfg,
+      overrideSeconds: typeof request.timeout === "number" ? request.timeout : undefined,
+    });
+    const activeRunAbort = registerChatAbortController({
+      chatAbortControllers: context.chatAbortControllers,
+      runId,
+      sessionId: resolvedSessionId ?? runId,
+      sessionKey: resolvedSessionKey,
+      timeoutMs,
+      now,
+      expiresAtMs: resolveAgentRunExpiresAtMs({ now, timeoutMs }),
+      ownerConnId: typeof client?.connId === "string" ? client.connId : undefined,
+      ownerDeviceId:
+        typeof client?.connect?.device?.id === "string" ? client.connect.device.id : undefined,
+      kind: "agent",
+    });
 
     const accepted = {
       runId,
@@ -922,104 +915,112 @@ export const agentHandlers: GatewayRequestHandlers = {
     });
     respond(true, accepted, undefined, { runId });
 
-    if (resolvedSessionKey) {
-      await reactivateCompletedSubagentSession({
-        sessionKey: resolvedSessionKey,
-        runId,
-      });
-    }
-
-    if (requestedSessionKey && resolvedSessionKey && isNewSession) {
-      emitSessionsChanged(context, {
-        sessionKey: resolvedSessionKey,
-        reason: "create",
-      });
-    }
-    if (resolvedSessionKey) {
-      emitSessionsChanged(context, {
-        sessionKey: resolvedSessionKey,
-        reason: "send",
-      });
-    }
-
-    if (shouldPrependStartupContext && resolvedSessionKey) {
-      const { runtimeWorkspaceDir } = resolveSessionRuntimeWorkspace({
-        cfg: cfgForAgent ?? cfg,
-        sessionKey: resolvedSessionKey,
-        sessionEntry,
-        spawnedBy: spawnedByValue,
-      });
-      const startupContextPrelude = await buildSessionStartupContextPrelude({
-        workspaceDir: runtimeWorkspaceDir,
-        cfg: cfgForAgent ?? cfg,
-      });
-      if (startupContextPrelude) {
-        message = `${startupContextPrelude}\n\n${message}`;
+    let dispatched = false;
+    try {
+      if (resolvedSessionKey) {
+        await reactivateCompletedSubagentSession({
+          sessionKey: resolvedSessionKey,
+          runId,
+        });
       }
-    }
 
-    const resolvedThreadId = explicitThreadId ?? deliveryPlan.resolvedThreadId;
-    const ingressAgentId =
-      agentId &&
-      (!resolvedSessionKey || resolveAgentIdFromSessionKey(resolvedSessionKey) === agentId)
-        ? agentId
-        : undefined;
+      if (requestedSessionKey && resolvedSessionKey && isNewSession) {
+        emitSessionsChanged(context, {
+          sessionKey: resolvedSessionKey,
+          reason: "create",
+        });
+      }
+      if (resolvedSessionKey) {
+        emitSessionsChanged(context, {
+          sessionKey: resolvedSessionKey,
+          reason: "send",
+        });
+      }
 
-    dispatchAgentRunFromGateway({
-      ingressOpts: {
-        message,
-        images,
-        imageOrder,
-        agentId: ingressAgentId,
-        provider: providerOverride,
-        model: modelOverride,
-        to: resolvedTo,
-        sessionId: resolvedSessionId,
-        sessionKey: resolvedSessionKey,
-        thinking: request.thinking,
-        deliver,
-        deliveryTargetMode,
-        channel: resolvedChannel,
-        accountId: resolvedAccountId,
-        threadId: resolvedThreadId,
-        runContext: {
-          messageChannel: originMessageChannel,
+      if (shouldPrependStartupContext && resolvedSessionKey) {
+        const { runtimeWorkspaceDir } = resolveSessionRuntimeWorkspace({
+          cfg: cfgForAgent ?? cfg,
+          sessionKey: resolvedSessionKey,
+          sessionEntry,
+          spawnedBy: spawnedByValue,
+        });
+        const startupContextPrelude = await buildSessionStartupContextPrelude({
+          workspaceDir: runtimeWorkspaceDir,
+          cfg: cfgForAgent ?? cfg,
+        });
+        if (startupContextPrelude) {
+          message = `${startupContextPrelude}\n\n${message}`;
+        }
+      }
+
+      const resolvedThreadId = explicitThreadId ?? deliveryPlan.resolvedThreadId;
+      const ingressAgentId =
+        agentId &&
+        (!resolvedSessionKey || resolveAgentIdFromSessionKey(resolvedSessionKey) === agentId)
+          ? agentId
+          : undefined;
+
+      dispatchAgentRunFromGateway({
+        ingressOpts: {
+          message,
+          images,
+          imageOrder,
+          agentId: ingressAgentId,
+          provider: providerOverride,
+          model: modelOverride,
+          to: resolvedTo,
+          sessionId: resolvedSessionId,
+          sessionKey: resolvedSessionKey,
+          thinking: request.thinking,
+          deliver,
+          deliveryTargetMode,
+          channel: resolvedChannel,
           accountId: resolvedAccountId,
+          threadId: resolvedThreadId,
+          runContext: {
+            messageChannel: originMessageChannel,
+            accountId: resolvedAccountId,
+            groupId: resolvedGroupId,
+            groupChannel: resolvedGroupChannel,
+            groupSpace: resolvedGroupSpace,
+            currentThreadTs: resolvedThreadId != null ? String(resolvedThreadId) : undefined,
+          },
           groupId: resolvedGroupId,
           groupChannel: resolvedGroupChannel,
           groupSpace: resolvedGroupSpace,
-          currentThreadTs: resolvedThreadId != null ? String(resolvedThreadId) : undefined,
-        },
-        groupId: resolvedGroupId,
-        groupChannel: resolvedGroupChannel,
-        groupSpace: resolvedGroupSpace,
-        spawnedBy: spawnedByValue,
-        timeout: request.timeout?.toString(),
-        bestEffortDeliver,
-        messageChannel: originMessageChannel,
-        runId,
-        lane: request.lane,
-        cleanupBundleMcpOnRunEnd: request.cleanupBundleMcpOnRunEnd === true,
-        extraSystemPrompt: request.extraSystemPrompt,
-        bootstrapContextMode: request.bootstrapContextMode,
-        bootstrapContextRunKind: request.bootstrapContextRunKind,
-        internalEvents: request.internalEvents,
-        inputProvenance,
-        abortSignal: agentRunAbortController.signal,
-        // Internal-only: allow workspace override for spawned subagent runs.
-        workspaceDir: resolveIngressWorkspaceOverrideForSpawnedRun({
           spawnedBy: spawnedByValue,
-          workspaceDir: sessionEntry?.spawnedWorkspaceDir,
-        }),
-        senderIsOwner,
-        allowModelOverride,
-      },
-      runId,
-      idempotencyKey: idem,
-      abortController: agentRunAbortController,
-      respond,
-      context,
-    });
+          timeout: request.timeout?.toString(),
+          bestEffortDeliver,
+          messageChannel: originMessageChannel,
+          runId,
+          lane: request.lane,
+          cleanupBundleMcpOnRunEnd: request.cleanupBundleMcpOnRunEnd === true,
+          extraSystemPrompt: request.extraSystemPrompt,
+          bootstrapContextMode: request.bootstrapContextMode,
+          bootstrapContextRunKind: request.bootstrapContextRunKind,
+          internalEvents: request.internalEvents,
+          inputProvenance,
+          abortSignal: activeRunAbort.controller.signal,
+          // Internal-only: allow workspace override for spawned subagent runs.
+          workspaceDir: resolveIngressWorkspaceOverrideForSpawnedRun({
+            spawnedBy: spawnedByValue,
+            workspaceDir: sessionEntry?.spawnedWorkspaceDir,
+          }),
+          senderIsOwner,
+          allowModelOverride,
+        },
+        runId,
+        idempotencyKey: idem,
+        abortController: activeRunAbort.controller,
+        respond,
+        context,
+      });
+      dispatched = true;
+    } finally {
+      if (!dispatched) {
+        activeRunAbort.cleanup();
+      }
+    }
   },
   "agent.identity.get": ({ params, respond }) => {
     if (!validateAgentIdentityParams(params)) {
